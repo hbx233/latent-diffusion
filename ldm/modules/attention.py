@@ -191,6 +191,30 @@ class CrossAttention(nn.Module):
         out = einsum('b i j, b j d -> b i d', attn, v)
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
         return self.to_out(out)
+    def forward_with_context_kvcache(self, x, k, v, mask=None):
+        h = self.heads
+        q = self.to_q(x)
+        q = rearrange(q, 'b n (h d) -> (b h) n d', h=h)
+        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+        if exists(mask):
+            mask = rearrange(mask, 'b ... -> b (...)')
+            max_neg_value = -torch.finfo(sim.dtype).max
+            mask = repeat(mask, 'b j -> (b h) () j', h=h)
+            sim.masked_fill_(~mask, max_neg_value)
+
+        # attention, what we cannot get enough of
+        attn = sim.softmax(dim=-1)
+
+        out = einsum('b i j, b j d -> b i d', attn, v)
+        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+        return self.to_out(out)
+    
+    def context_kvcache(self, context):
+        h = self.heads
+        k = self.to_k(context)
+        v = self.to_v(context)
+        k, v = map(lambda t: rearrange(t,'b n (h d) -> (b h) n d', h=h), (k, v))
+        return k, v
 
 
 class BasicTransformerBlock(nn.Module):
@@ -198,6 +222,7 @@ class BasicTransformerBlock(nn.Module):
         super().__init__()
         self.attn1 = CrossAttention(query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout)  # is a self-attention
         self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
+        # context doesn't change in each denoising step, the context kv and be cached and reduce redundant computation.
         self.attn2 = CrossAttention(query_dim=dim, context_dim=context_dim,
                                     heads=n_heads, dim_head=d_head, dropout=dropout)  # is self-attn if context is none
         self.norm1 = nn.LayerNorm(dim)
@@ -213,6 +238,15 @@ class BasicTransformerBlock(nn.Module):
         x = self.attn2(self.norm2(x), context=context) + x
         x = self.ff(self.norm3(x)) + x
         return x
+    
+    def forward_with_context_kv_cache(self, x, k, v):
+        x = self.attn1(self.norm1(x)) + x
+        x = self.attn2.forward_with_context_kvcache(self.norm2(x), k=k, v=v) + x
+        x = self.ff(self.norm3(x)) + x
+        return x
+    
+    def context_kvcache(self, context):
+        return self.attn2.context_kvcache(context=context)
 
 
 class SpatialTransformer(nn.Module):
@@ -222,6 +256,7 @@ class SpatialTransformer(nn.Module):
     and reshape to b, t, d.
     Then apply standard transformer action.
     Finally, reshape to image
+    depth: number of transformer blocks
     """
     def __init__(self, in_channels, n_heads, d_head,
                  depth=1, dropout=0., context_dim=None):
@@ -253,9 +288,31 @@ class SpatialTransformer(nn.Module):
         x_in = x
         x = self.norm(x)
         x = self.proj_in(x)
-        x = rearrange(x, 'b c h w -> b (h w) c')
+        x = rearrange(x, 'b c h w -> b (h w) c') # flatten the 2D input to 1D (b x n x c) where n is sequence length (h x w)
         for block in self.transformer_blocks:
             x = block(x, context=context)
         x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
         x = self.proj_out(x)
         return x + x_in
+    
+    def forward_with_context_kvcaches(self, x, context_kvcaches):
+        assert len(context_kvcaches) == len(self.transformer_blocks) * 2
+        b, c, h, w = x.shape
+        x_in = x
+        x = self.norm(x)
+        x = self.proj_in(x)
+        x = rearrange(x, 'b c h w -> b (h w) c') # flatten the 2D input to 1D (b x n x c) where n is sequence length (h x w)
+        for i in range(len(self.transformer_blocks)):
+            k = context_kvcaches[i*2]
+            v = context_kvcaches[i*2+1]
+            x = self.transformer_blocks[i].forward_with_context_kv_cache(x, k, v)
+        x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
+        x = self.proj_out(x)
+        return x + x_in
+    
+    def context_kvcache(self, context):
+        context_kvcaches = []
+        for block in self.transformer_blocks:
+            # Create one kv cache per transformer block
+            context_kvcaches += block.context_kvcache(context)
+        return context_kvcaches

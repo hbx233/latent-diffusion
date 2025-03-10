@@ -86,6 +86,34 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
             else:
                 x = layer(x)
         return x
+    
+    def num_spatial_transformer_blocks(self):
+        num = 0
+        for layer in self:
+            if isinstance(layer, SpatialTransformer):
+                num += len(layer.transformer_blocks)
+        return num
+    
+    def context_kvcaches(self, context):
+        assert context != None
+        block_kvcaches = []
+        for layer in self:
+            if isinstance(layer, SpatialTransformer):
+                block_kvcaches += layer.context_kvcache(context)
+        return block_kvcaches
+    
+    def forward_with_context_kvcaches(self, x, emb, context_kvcaches=None):
+        idx = 0
+        for layer in self:
+            if isinstance(layer, TimestepBlock):
+                x = layer(x, emb)
+            elif isinstance(layer, SpatialTransformer):
+                num_caches = len(layer.transformer_blocks) * 2
+                x = layer.forward_with_context_kvcaches(x, context_kvcaches[idx:idx+num_caches])
+                idx+=num_caches
+            else:
+                x = layer(x)
+        return x
 
 
 class Upsample(nn.Module):
@@ -740,6 +768,34 @@ class UNetModel(nn.Module):
             return self.id_predictor(h)
         else:
             return self.out(h)
+    def context_kvcaches(self, context):
+        kvcaches = []
+        for module in self.input_blocks:
+            # Compute kv caches for transformer layers in one block
+            kvcaches += module.context_kvcaches(context)
+        kvcaches += self.middle_block.context_kvcaches(context)
+        for module in self.output_blocks:
+            kvcaches += module.context_kvcaches(context)
+        return kvcaches
+    
+    def forward_with_context_kvcaches(self, x, timesteps, context_kvcaches, y=None, **kwargs):
+        print("UNet")
+        print("x: ", x.shape, x.dtype)
+        print("timesteps: ", timesteps.shape, timesteps.dtype)
+        print("context kvcaches: ", len(context_kvcaches))
+        assert (y is not None) == (
+            self.num_classes is not None
+        ), "must specify y if and only if the model is class-conditional"
+        assert context_kvcaches is not None, "Invalid context kv caches!!"
+        hs = []
+        t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
+        emb = self.time_embed(t_emb)
+
+        if self.num_classes is not None:
+            assert y.shape == (x.shape[0],)
+            emb = emb + self.label_emb(y)
+
+
 
 
 class EncoderUNetModel(nn.Module):

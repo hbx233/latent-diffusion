@@ -10,7 +10,10 @@ from torchvision.utils import make_grid
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
+from optimization.ddim_trt import DDIMSamplerTRT
 
+import tensorrt as trt
+from optimization.utils import *
 
 def load_model_from_config(config, ckpt, verbose=False):
     print(f"Loading model from {ckpt}")
@@ -67,12 +70,6 @@ if __name__ == "__main__":
         default=0.0,
         help="ddim eta (eta=0.0 corresponds to deterministic sampling",
     )
-    parser.add_argument(
-        "--n_iter",
-        type=int,
-        default=1,
-        help="sample this often",
-    )
 
     parser.add_argument(
         "--H",
@@ -103,7 +100,6 @@ if __name__ == "__main__":
     )
     opt = parser.parse_args()
 
-
     config = OmegaConf.load("configs/latent-diffusion/txt2img-1p4B-eval.yaml")  # TODO: Optionally download from same location as ckpt and chnage this logic
     model = load_model_from_config(config, "models/ldm/text2img-large/model.ckpt")  # TODO: check path
 
@@ -114,6 +110,7 @@ if __name__ == "__main__":
         sampler = PLMSSampler(model)
     else:
         sampler = DDIMSampler(model)
+        # sampler = DDIMSamplerTRT(model,ddim_num_steps=opt.ddim_steps, ddim_eta=opt.ddim_eta)
 
     os.makedirs(opt.outdir, exist_ok=True)
     outpath = opt.outdir
@@ -125,33 +122,68 @@ if __name__ == "__main__":
     os.makedirs(sample_path, exist_ok=True)
     base_count = len(os.listdir(sample_path))
 
+    logger = trt.Logger(trt.Logger.VERBOSE)
+    bert_engine = load_engine("./engine/BERT.plan", logger)
+    bert_context = bert_engine.create_execution_context()
+    c = torch.empty((1,77,1280), dtype=torch.float32, device='cuda')
+    uc = torch.empty((1,77,1280), dtype=torch.float32, device='cuda')
+
+    decode_engine = load_engine("./engine/first_stage_model.plan", logger)
+    decode_context = decode_engine.create_execution_context()
+
+    num_iter = 6
+    warmup_iters = 3
+
+    use_trt = True
+
     all_samples=list()
-    with torch.no_grad():
-        with model.ema_scope():
-            uc = None
-            if opt.scale != 1.0:
-                uc = model.get_learned_conditioning(opt.n_samples * [""])
-            for n in trange(opt.n_iter, desc="Sampling"):
-                c = model.get_learned_conditioning(opt.n_samples * [prompt])
-                shape = [4, opt.H//8, opt.W//8]
-                samples_ddim, _ = sampler.sample(S=opt.ddim_steps,
-                                                 conditioning=c,
-                                                 batch_size=opt.n_samples,
-                                                 shape=shape,
-                                                 verbose=False,
-                                                 unconditional_guidance_scale=opt.scale,
-                                                 unconditional_conditioning=uc,
-                                                 eta=opt.ddim_eta)
+    with torch.autograd.profiler.profile(enabled=False):
+        with torch.no_grad():
+            with model.ema_scope():
+                for n in trange(num_iter, desc="Sampling"):
+                    if n == warmup_iters:
+                        torch.cuda.cudart().cudaProfilerStart()
+                    torch.cuda.nvtx.range_push("iteration{}".format(n))
+                    torch.cuda.nvtx.range_push("BERT")
+                    if use_trt:
+                        uc_tokens = model.cond_stage_model.tknz_fn([""]).to(dtype=torch.int32, device='cuda')
+                        c_tokens = model.cond_stage_model.tknz_fn([prompt]).to(dtype=torch.int32, device='cuda')
+                        bindings = trt_get_tensor_bindings(bert_engine, [uc_tokens, uc])
+                        bert_context.execute_v2(bindings)
+                        bindings = trt_get_tensor_bindings(bert_engine, [c_tokens, c])
+                        bert_context.execute_v2(bindings)
+                    else:
+                        uc_torch = model.get_learned_conditioning([""])
+                        c_torch = model.get_learned_conditioning([prompt])
+                    torch.cuda.nvtx.range_pop()
+                    shape = [4, opt.H//8, opt.W//8]
+                    samples_ddim, _ = sampler.sample(S=opt.ddim_steps,
+                                                     conditioning=c,
+                                                     batch_size=opt.n_samples,
+                                                     shape=shape,
+                                                     verbose=False,
+                                                     unconditional_guidance_scale=opt.scale,
+                                                     unconditional_conditioning=uc,
+                                                     eta=opt.ddim_eta)
+                    torch.cuda.nvtx.range_push("Decoder")
+                    if use_trt:
+                        # image_tensor = model.decode_first_stage(samples_ddim)
+                        samples_ddim = 1. / model.scale_factor * samples_ddim
+                        image_tensor= torch.empty((1,3,256,256), dtype=torch.float32, device='cuda')
+                        decode_bindings = [samples_ddim.data_ptr(), image_tensor.data_ptr()]
+                        decode_context.execute_v2(decode_bindings)
+                    else:
+                        image_tensor = model.decode_first_stage(samples_ddim)
+                    torch.cuda.nvtx.range_pop()
+                    image_tensor = torch.clamp((image_tensor+1.0)/2.0, min=0.0, max=1.0)
 
-                x_samples_ddim = model.decode_first_stage(samples_ddim)
-                x_samples_ddim = torch.clamp((x_samples_ddim+1.0)/2.0, min=0.0, max=1.0)
-
-                for x_sample in x_samples_ddim:
-                    x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
-                    Image.fromarray(x_sample.astype(np.uint8)).save(os.path.join(sample_path, f"{base_count:04}.png"))
-                    base_count += 1
-                all_samples.append(x_samples_ddim)
-
+                    for x_sample in image_tensor:
+                        x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
+                        Image.fromarray(x_sample.astype(np.uint8)).save(os.path.join(sample_path, f"{base_count:04}.png"))
+                        base_count += 1
+                    all_samples.append(image_tensor)
+                    torch.cuda.nvtx.range_pop()
+                torch.cuda.cudart().cudaProfilerStop()
 
     # additionally, save as grid
     grid = torch.stack(all_samples, 0)
