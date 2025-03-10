@@ -38,4 +38,5 @@ We can also build TRT engine for BERT embedder and first stage decoder, bring th
 ![](assets/final.png)
 
 Here're some images generated from the optimized models, cheers
+
 ![](assets/0009.png) ![](assets/0026.png) ![](assets/0046.png)
